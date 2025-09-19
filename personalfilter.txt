@@ -1,0 +1,1489 @@
+#include <Eigen/Dense> // For matrix operations
+#include <vector>
+#include <map>
+#include <random>
+#include <cmath>
+#include <limits>      // For std::numeric_limits
+#include <iostream>
+#include <algorithm>   // For std::min, std::max
+#include <chrono>      // For std::chrono
+#include <thread>      // For std::this_thread::sleep_for
+#include <numeric>     // For std::accumulate, std::iota
+#include <iomanip>     // For std::setprecision
+
+// Define M_PI if not already defined (common in C++ but not strictly standard)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// --- Global Constants and Configuration ---
+const int STATE_DIM = 16; // [x,y,z,vx,vy,vz,ax,ay,az,yaw,pitch,roll,yaw_rate,pitch_rate,roll_rate,rcs_estimate]
+const int MEAS_DIM = 4;   // [range, doppler, azimuth, elevation]
+const int NUM_PARTICLES = 1000; // For Particle Filter
+const int RESIDUAL_WINDOW_SIZE = 20; // For Innovation Gate Memory
+
+const double DT = 0.1; // Simulation time step (seconds)
+
+// Tuning parameters for adaptive R/Q
+const double R_MIN_BASE = 0.001; // Minimum base measurement noise
+const double R_MAX_BASE = 100.0; // Maximum base measurement noise
+const double K_CONFIDENCE_R = 5.0; // Steepness of R adaptation
+const double MAX_EXPECTED_SNR = 30.0; // dB
+const double MAX_EXPECTED_CLUTTER = 1.0; // Normalized score (0-1)
+const double VISIBILITY_MIN_COEFF = 0.01; // Minimum visibility coefficient to prevent division by zero
+
+const double Q_BASE_FACTOR = 0.1; // Base process noise factor
+const double Q_STEALTH_FACTOR = 100.0; // Multiplier for Stealth model Q
+const double K_Q_ENTROPY = 0.5; // Tuning for Q adjustment by entropy
+const double K_R_ENTROPY = 0.5; // Tuning for R adjustment by entropy
+
+// Data Association Thresholds
+const double GATE_THRESHOLD_SQ = 20.0; // Chi-squared threshold for gating (e.g., for 4 DOF, 20 is very loose)
+const double MAX_PLAUSIBLE_ACCEL_NORM = 50.0; // m/s^2 (for motion complexity penalty)
+
+// PF Activation/Deactivation Thresholds
+const double PF_IMM_CONFIDENCE_LOW_THRESHOLD = 0.5;
+const double PF_IMM_MAX_MODE_PROB_THRESHOLD = 0.5;
+const double PF_IMM_MAX_MODE_PROB_REACTIVATE_THRESHOLD = 0.8;
+const double EIGENVALUE_ANOMALY_THRESHOLD = 0.8; // Anomaly score (0-1) to trigger PF/suspicion
+
+// Trust Score Weights (tune carefully)
+const double W_CHI2 = 0.20;
+const double W_P_DRONE = 0.25;
+const double W_S_MD = 0.15;
+const double W_HISTORY = 0.10;
+const double W_RCS = 0.10;
+const double W_IMM_ENTROPY = 0.10;
+const double W_PF_ENTROPY = 0.10;
+const double W_EIGENVALUE_ANOMALY = 0.05;
+const double W_MICRO_PATTERN = 0.05;
+
+// List of available motion models
+const std::vector<std::string> MODEL_TYPES = {"CV", "CA", "CT", "ST"};
+
+// --- Data Structures ---
+struct Measurement {
+    double timestamp;
+    Eigen::VectorXd z;        // [range, doppler, azimuth, elevation] (MEAS_DIM x 1)
+    double snr;               // Signal-to-Noise Ratio (dB)
+    double clutter_level;     // Normalized clutter score (0-1)
+    std::string sensor_id;    // Identifier for multi-static support
+    bool is_spoofed = false;  // Flag from pre-processor
+    bool is_jammed = false;   // Flag from pre-processor
+    double signal_power_drop = 0.0; // For FSR/shadowing (conceptual)
+};
+
+struct RawSensorData {
+    double timestamp;
+    // Placeholder for raw sensor data (e.g., radar IQ data, IMU readings from multiple sensors)
+    // In a real system, this would be complex data streams.
+};
+
+struct ProcessedSensorInputs {
+    std::vector<Measurement> measurements;
+    double classifier_confidence; // P_drone (aggregated for simplicity, could be per-measurement)
+    double micro_doppler_strength; // s_md (aggregated for simplicity, could be per-measurement)
+    double overall_clutter_score;
+    std::map<std::string, double> micro_pattern_confidences; // e.g., {"jittery_hover": 0.8}
+};
+
+struct StateVector {
+    Eigen::VectorXd x; // STATE_DIM x 1 state vector
+    Eigen::MatrixXd P; // STATE_DIM x STATE_DIM covariance matrix
+};
+
+struct Association {
+    std::string track_id;
+    int measurement_idx; // Index of the measurement in the current scan's measurements vector
+    double likelihood;   // Likelihood of this association
+};
+
+// --- Forward Declarations of Core Filter Classes ---
+class SRUKF;
+class IMMFilter;
+class ParticleFilter;
+
+// --- Auxiliary Helper Classes ---
+
+// BeliefUpdater Class (Adaptive Belief Propagation)
+class BeliefUpdater {
+public:
+    BeliefUpdater(int nm) : num_modes_(nm) {}
+
+    // Updates mode probabilities using raw likelihoods and prior probabilities
+    // based on a Bayesian update incorporating the transition matrix.
+    Eigen::VectorXd update_probabilities(const Eigen::VectorXd& raw_likelihoods,
+                                         const Eigen::VectorXd& prev_mode_probs,
+                                         const Eigen::MatrixXd& transition_matrix) {
+        // Calculate prediction term: sum_i (pi_ij * mu_i(k-1))
+        Eigen::VectorXd predicted_probs = transition_matrix.transpose() * prev_mode_probs;
+
+        // Element-wise product of likelihoods and predicted probabilities
+        Eigen::VectorXd unnormalized_posterior = raw_likelihoods.cwiseProduct(predicted_probs);
+
+        // Normalize the posterior
+        double sum_posterior = unnormalized_posterior.sum();
+        if (sum_posterior > std::numeric_limits<double>::epsilon()) {
+            return unnormalized_posterior / sum_posterior;
+        } else {
+            // Fallback: if all likelihoods are zero, maintain previous probabilities or uniform
+            std::cerr << "Warning: ABP likelihoods sum to zero. Maintaining previous probabilities." << std::endl;
+            return prev_mode_probs; // Or Eigen::VectorXd::Constant(num_modes_, 1.0 / num_modes_);
+        }
+    }
+private:
+    int num_modes_;
+};
+
+// GCICombiner Class (Generalized Covariance Intersection)
+class GCICombiner {
+public:
+    // Standard Covariance Intersection for two estimates
+    static StateVector covariance_intersection(const StateVector& s1, const StateVector& s2, double omega) {
+        // Ensure matrices are invertible and SPD
+        Eigen::MatrixXd P1_inv = s1.P.inverse(); // In production, use robust inverse (e.g., pseudo-inverse)
+        Eigen::MatrixXd P2_inv = s2.P.inverse();
+
+        Eigen::MatrixXd Pci_inv = omega * P1_inv + (1.0 - omega) * P2_inv;
+        StateVector res;
+        res.P = Pci_inv.inverse();
+        res.x = res.P * (omega * P1_inv * s1.x + (1.0 - omega) * P2_inv * s2.x);
+        return res;
+    }
+
+    // Combine multiple estimates with weights mu via iterative pairwise CI
+    // This is a common heuristic for GCI, though optimal GCI is more complex.
+    static StateVector combine(const std::vector<StateVector>& states, const Eigen::VectorXd& mu) {
+        if (states.empty()) return StateVector();
+        if (states.size() == 1) return states[0];
+
+        // Start with the first state as the initial fused state
+        StateVector fused = states[0];
+        fused.x = states[0].x;
+        fused.P = states[0].P;
+
+        for (size_t i = 1; i < states.size(); ++i) {
+            // Calculate omega for pairwise CI. This is a heuristic.
+            // A common approach is to weight by relative certainty or mode probability.
+            // Here, we use a simple ratio of mode probabilities.
+            double current_mu_sum = mu.head(i + 1).sum();
+            double omega = mu(i) / (current_mu_sum > std::numeric_limits<double>::epsilon() ? current_mu_sum : 1.0);
+
+            // Ensure omega is within [0, 1]
+            omega = std::max(0.0, std::min(1.0, omega));
+
+            fused = covariance_intersection(fused, states[i], omega);
+        }
+        return fused;
+    }
+};
+
+// ResidualTracker Class (Innovation Gate Memory)
+class ResidualTracker {
+public:
+    ResidualTracker(int window_size) : window_size_(window_size) {}
+
+    void update(const Eigen::VectorXd& innovation) {
+        innovation_history_.push_back(innovation);
+        if (innovation_history_.size() > window_size_) {
+            innovation_history_.erase(innovation_history_.begin());
+        }
+    }
+
+    // Checks for anomalous behavior in residual history (e.g., sudden jumps, consistent bias)
+    // This is a simplified check. In practice, CUSUM or other statistical tests would be used.
+    bool is_anomalous() const {
+        if (innovation_history_.size() < window_size_ / 2) return false; // Need enough data
+
+        Eigen::VectorXd mean_innovation = Eigen::VectorXd::Zero(innovation_history_[0].size());
+        for (const auto& innov : innovation_history_) {
+            mean_innovation += innov;
+        }
+        mean_innovation /= innovation_history_.size();
+
+        // Simple check: if mean innovation is consistently large
+        if (mean_innovation.norm() > 3.0) { // Tune this threshold
+            return true;
+        }
+
+        // Could add variance checks, trend analysis here
+        return false;
+    }
+
+    void clear() {
+        innovation_history_.clear();
+    }
+
+    const std::vector<Eigen::VectorXd>& get_history() const {
+        return innovation_history_;
+    }
+private:
+    std::vector<Eigen::VectorXd> innovation_history_;
+    int window_size_;
+};
+
+// EigenvalueMonitor Class
+class EigenvalueMonitor {
+public:
+    EigenvalueMonitor() {}
+
+    // Analyzes the covariance matrix eigenvalues to detect anomalies.
+    // Returns an anomaly score (0-1), where 1 is highly anomalous.
+    double analyze_covariance(const Eigen::MatrixXd& P) {
+        if (P.rows() == 0 || P.cols() == 0) return 0.0;
+
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(P);
+        Eigen::VectorXd evals = es.eigenvalues();
+
+        double max_lambda = evals.maxCoeff();
+        double min_lambda = evals.minCoeff();
+
+        // Check for ill-conditioning (large spread)
+        if (min_lambda < std::numeric_limits<double>::epsilon()) min_lambda = std::numeric_limits<double>::epsilon(); // Avoid div by zero
+        double spread_ratio = max_lambda / min_lambda;
+        const double SPREAD_THRESHOLD = 1000.0; // Tune this: high ratio means ill-conditioned
+        double spread_anomaly = std::min(1.0, spread_ratio / SPREAD_THRESHOLD);
+
+        // Check for overall large magnitude (divergence)
+        double trace = P.trace();
+        const double TRACE_THRESHOLD = 1e6; // Tune this: very large trace means filter diverging
+        double trace_anomaly = std::min(1.0, trace / TRACE_THRESHOLD);
+
+        // Combine scores (can be weighted)
+        return std::max(spread_anomaly, trace_anomaly);
+    }
+};
+
+// TrackEntropyMonitor Class
+class TrackEntropyMonitor {
+public:
+    // Calculates Shannon entropy of IMM mode probabilities
+    double calculate_imm_entropy(const Eigen::VectorXd& mode_probabilities) {
+        double entropy = 0.0;
+        for (int i = 0; i < mode_probabilities.size(); ++i) {
+            if (mode_probabilities(i) > std::numeric_limits<double>::epsilon()) {
+                entropy -= mode_probabilities(i) * std::log(mode_probabilities(i));
+            }
+        }
+        // Normalize entropy to 0-1 range
+        double max_entropy = std::log(static_cast<double>(mode_probabilities.size()));
+        return (max_entropy > 0) ? entropy / max_entropy : 0.0;
+    }
+
+    // Calculates effective number of particles (N_eff) as an inverse measure of PF entropy
+    double calculate_pf_entropy(double effective_num_particles, int num_particles) {
+        // N_eff / N_particles gives a 0-1 score, higher is better (less entropy)
+        return (num_particles > 0) ? effective_num_particles / num_particles : 0.0;
+    }
+
+    // Calculates entropy of state covariance (e.g., using log-determinant)
+    double calculate_state_covariance_entropy(const Eigen::MatrixXd& P) {
+        // Higher determinant means higher uncertainty/entropy
+        return 0.5 * std::log(std::max(P.determinant(), std::numeric_limits<double>::epsilon())); // Ensure positive determinant
+    }
+};
+
+// EntropyRegulator Class (Intelligent Q-R Adaptation via Entropy)
+class EntropyRegulator {
+public:
+    EntropyRegulator(double k_q, double k_r) : k_q_(k_q), k_r_(k_r) {}
+
+    // Adjusts Q based on entropy score (higher entropy -> higher Q)
+    Eigen::MatrixXd adjust_Q(const Eigen::MatrixXd& Q_base, double entropy_score) {
+        // Exponential increase with entropy
+        return Q_base * std::exp(k_q_ * entropy_score);
+    }
+
+    // Adjusts R based on entropy score (higher entropy -> higher R)
+    Eigen::MatrixXd adjust_R(const Eigen::MatrixXd& R_base, double entropy_score) {
+        // Exponential increase with entropy
+        return R_base * std::exp(k_r_ * entropy_score);
+    }
+private:
+    double k_q_, k_r_;
+};
+
+// TrustScoreCalculator Class
+class TrustScoreCalculator {
+public:
+    static double compute_confidence(const StateVector& fused_state,
+                                     const Eigen::VectorXd& imm_innovation, // Pass the innovation vector directly
+                                     double P_drone, double s_md,
+                                     double eigenvalue_anomaly_score,
+                                     double micro_pattern_confidence,
+                                     const Eigen::VectorXd& imm_mode_probabilities,
+                                     double pf_effective_np, int pf_num_particles,
+                                     const std::vector<double>& rcs_estimate_history,
+                                     const std::vector<Eigen::VectorXd>& innovation_history) {
+        // Normalize components
+        const double MAX_EXPECTED_CHI2_NORM = 10.0; // Tune based on typical innovation norms
+        double normalized_chi2 = std::min(1.0, imm_innovation.norm() / MAX_EXPECTED_CHI2_NORM);
+
+        double rcs_estimate = fused_state.x(15); // Assuming RCS is at index 15
+        const double MAX_EXPECTED_RCS = 100.0; // Example max RCS for normalization (m^2)
+        double normalized_rcs_estimate = std::min(1.0, rcs_estimate / MAX_EXPECTED_RCS);
+
+        // Track history factor
+        double track_history_factor = std::min(1.0, (double)innovation_history.size() / 50.0); // Max 50 frames history
+
+        // IMM Mode Certainty (1 - normalized entropy)
+        TrackEntropyMonitor tem;
+        double imm_entropy = tem.calculate_imm_entropy(imm_mode_probabilities);
+        double imm_certainty = 1.0 - imm_entropy;
+
+        // PF Particle Entropy (normalized effective Np)
+        double pf_certainty = tem.calculate_pf_entropy(pf_effective_np, pf_num_particles);
+
+        // Combine scores using weights
+        double trust_score = (W_CHI2 * (1.0 - normalized_chi2)) +
+                             (W_P_DRONE * P_drone) +
+                             (W_S_MD * s_md) +
+                             (W_HISTORY * track_history_factor) +
+                             (W_RCS * (1.0 - normalized_rcs_estimate)) + // Lower RCS implies higher stealth confidence
+                             (W_IMM_ENTROPY * imm_certainty) +
+                             (W_PF_ENTROPY * pf_certainty) +
+                             (W_EIGENVALUE_ANOMALY * (1.0 - eigenvalue_anomaly_score)) + // Lower anomaly score is better
+                             (W_MICRO_PATTERN * micro_pattern_confidence);
+
+        return std::max(0.0, std::min(1.0, trust_score)); // Clamp between 0 and 1
+    }
+};
+
+// SensorController Class (for Cognitive Feedback Loop)
+class SensorController {
+public:
+    void request_waveform_change(const std::string& sensor_id, const std::string& waveform_type) {
+        std::cout << "[SensorController] Requesting sensor " << sensor_id << " to change waveform to: " << waveform_type << std::endl;
+        // In a real system, this would send a command to the sensor hardware/software.
+    }
+    void request_scanning_pattern(const std::string& sensor_id, const Eigen::Vector3d& focus_point) {
+        std::cout << "[SensorController] Requesting sensor " << sensor_id << " to focus scan on: (" << focus_point.x() << ", " << focus_point.y() << ", " << focus_point.z() << ")" << std::endl;
+    }
+    void request_power_increase(const std::string& sensor_id, double power_factor) {
+        std::cout << "[SensorController] Requesting sensor " << sensor_id << " to increase power by factor: " << power_factor << std::endl;
+    }
+    void request_passive_mode(const std::string& sensor_id, const std::string& illuminator_type) {
+        std::cout << "[SensorController] Requesting sensor " << sensor_id << " to activate passive mode using illuminator: " << illuminator_type << std::endl;
+    }
+};
+
+// SparseOutlierModule Class (Experimental Sparse Recovery Filtering - conceptual)
+class SparseOutlierModule {
+public:
+    // This is a highly complex algorithm (e.g., based on LASSO, Basis Pursuit).
+    // Placeholder implementation.
+    Eigen::VectorXd extract_sparse_component(const Eigen::VectorXd& residual, const Eigen::MatrixXd& H, double lambda_param) {
+        // std::cout << "[SparseOutlierModule] Performing sparse recovery (conceptual)." << std::endl;
+        // In a real implementation, this would solve an optimization problem:
+        // min ||s||_1 subject to ||residual - H*s||_2^2 < epsilon
+        // or min 0.5*||residual - H*s||_2^2 + lambda_param*||s||_1
+        return Eigen::VectorXd::Zero(residual.size()); // Return zero for now
+    }
+};
+
+// MicroPatternManager Class (Micro-Pattern Learning via Kalman Bank - conceptual)
+class MicroPatternManager {
+public:
+    void process_raw_data(const RawSensorData& raw_data) {
+        // This would involve running small, specialized Kalman filters or ML models
+        // on high-resolution raw sensor data (e.g., micro-Doppler spectrograms)
+        // to detect specific fine-grained patterns (e.g., rotor blade flutter, specific evasive jinks).
+        // For demonstration, we'll just simulate confidence.
+        // std::cout << "[MicroPatternManager] Processing raw data for micro-patterns (conceptual)." << std::endl;
+    }
+    double get_pattern_confidence(const std::string& pattern_type) {
+        // Return a simulated confidence for a specific pattern type
+        if (pattern_type == "jittery_hover") return 0.75; // Example
+        return 0.0;
+    }
+};
+
+// BackwardSmoother Class (Rauch–Tung–Striebel - conceptual)
+class BackwardSmoother {
+public:
+    void smooth(std::vector<StateVector>& track_history, const std::vector<Measurement>& measurement_history) {
+        // std::cout << "[BackwardSmoother] Performing RTS smoothing (conceptual)." << std::endl;
+        // This would implement the RTS algorithm:
+        // 1. Run forward filter to get x_k|k and P_k|k
+        // 2. Run backward pass from N to 1:
+        //    x_k|N = x_k|k + J_k * (x_k+1|N - x_k+1|k)
+        //    P_k|N = P_k|k + J_k * (P_k+1|N - P_k+1|k) * J_k.transpose()
+        //    where J_k is the smoother gain.
+    }
+};
+
+// MultiBankManager Class (Multiple Filter Banks with Voting - conceptual)
+class MultiBankManager {
+public:
+    void add_filter_bank(IMMFilter* bank) {
+        filter_banks_.push_back(bank);
+    }
+    std::vector<StateVector> vote_estimates() {
+        // std::cout << "[MultiBankManager] Voting on estimates from multiple filter banks (conceptual)." << std::endl;
+        // This would involve:
+        // 1. Getting estimates and confidence from each filter bank.
+        // 2. Performing a consensus algorithm (e.g., weighted average, clustering, or majority vote).
+        return {};
+    }
+private:
+    std::vector<IMMFilter*> filter_banks_;
+};
+
+// RFSPHDModel Class (Random Finite Set PHD Filter - conceptual)
+class RFSPHDModel {
+public:
+    RFSPHDModel(int state_dim, int meas_dim) {
+        // std::cout << "[RFSPHDModel] Initializing RFS PHD filter (conceptual)." << std::endl;
+    }
+    void predict(double dt) {
+        // std::cout << "[RFSPHDModel] Predicting target density (conceptual)." << std::endl;
+    }
+    void update(const std::vector<Measurement>& measurements) {
+        // std::cout << "[RFSPHDModel] Updating target density with measurements (conceptual)." << std::endl;
+    }
+    std::vector<StateVector> extract_targets(double birth_threshold) {
+        // std::cout << "[RFSPHDModel] Extracting targets from PHD peaks (conceptual)." << std::endl;
+        return {};
+    }
+};
+
+// SensorCorrectionModel Class (conceptual)
+class SensorCorrectionModel {
+public:
+    // Applies sensor-specific calibration and offset corrections
+    Eigen::VectorXd correct_measurement(const Eigen::VectorXd& raw_z, const std::string& sensor_id) {
+        // Placeholder: apply identity correction
+        return raw_z;
+    }
+    // Provides Jacobian of sensor parameters if needed for more complex measurement models.
+    // This is for advanced sensor modeling, e.g., if sensor bias is part of the state.
+    Eigen::MatrixXd get_jacobian_for_sensor(const std::string& sensor_id) {
+        return Eigen::MatrixXd::Identity(MEAS_DIM, STATE_DIM); // Placeholder
+    }
+};
+
+// --- Core Filter Implementations ---
+
+// Square-Root Unscented Kalman Filter (SRUKF)
+class SRUKF {
+public:
+    SRUKF(int state_dim, int meas_dim, const std::string& model_type)
+        : x_(Eigen::VectorXd::Zero(state_dim)), P_(Eigen::MatrixXd::Identity(state_dim, state_dim)),
+          model_type_(model_type), likelihood_(1.0), innovation_(Eigen::VectorXd::Zero(meas_dim)),
+          innovationCov_(Eigen::MatrixXd::Zero(meas_dim, meas_dim)) {
+        // UKF parameters (tune these for optimal performance)
+        double alpha = 1e-3; // Spread of sigma points
+        double beta = 2.0;   // Incorporates prior knowledge of distribution (beta=2 for Gaussian)
+        double kappa = 0.0;  // Secondary scaling parameter (often 0 or 3-L for L-dim state)
+
+        lambda_ = alpha * alpha * (state_dim + kappa) - state_dim;
+        Wm_.resize(2 * state_dim + 1); // Weights for mean
+        Wc_.resize(2 * state_dim + 1); // Weights for covariance
+
+        Wm_(0) = lambda_ / (state_dim + lambda_);
+        Wc_(0) = lambda_ / (state_dim + lambda_) + (1 - alpha * alpha + beta);
+        for (int i = 1; i < 2 * state_dim + 1; ++i) {
+            Wm_(i) = 1.0 / (2.0 * (state_dim + lambda_));
+            Wc_(i) = 1.0 / (2.0 * (state_dim + lambda_));
+        }
+    }
+
+    void initialize(const Eigen::VectorXd& x0, const Eigen::MatrixXd& P0) {
+        x_ = x0;
+        P_ = P0;
+        apply_matrix_guardrails(); // Ensure P0 is SPD
+    }
+
+    // Generates sigma points from current state and covariance
+    std::vector<Eigen::VectorXd> generate_sigma_points() {
+        std::vector<Eigen::VectorXd> sigma_points(2 * x_.size() + 1);
+        sigma_points[0] = x_;
+
+        // Compute square root of P using Cholesky decomposition
+        Eigen::MatrixXd L;
+        Eigen::LLT<Eigen::MatrixXd> llt(P_);
+        if (llt.info() == Eigen::Success) {
+            L = llt.matrixL();
+        } else {
+            // Fallback for non-positive definite covariance (should be rare if guardrails work)
+            // Add a small diagonal perturbation and re-Cholesky
+            Eigen::MatrixXd P_perturbed = P_ + Eigen::MatrixXd::Identity(P_.rows(), P_.cols()) * 1e-9;
+            llt.compute(P_perturbed);
+            if (llt.info() == Eigen::Success) {
+                L = llt.matrixL();
+            } else {
+                std::cerr << "Error: SRUKF failed Cholesky even after perturbation. Using identity L." << std::endl;
+                L = Eigen::MatrixXd::Identity(P_.rows(), P_.cols()) * std::sqrt(P_.trace() / P_.rows());
+            }
+        }
+
+        double scale = std::sqrt(x_.size() + lambda_);
+
+        for (int i = 0; i < x_.size(); ++i) {
+            sigma_points[i + 1] = x_ + scale * L.col(i);
+            sigma_points[i + 1 + x_.size()] = x_ - scale * L.col(i);
+        }
+        return sigma_points;
+    }
+
+    // Predict step using Unscented Transform
+    void predict(double dt, const Eigen::MatrixXd& Q) {
+        std::vector<Eigen::VectorXd> sigma_points = generate_sigma_points();
+        std::vector<Eigen::VectorXd> transformed_sigma_points(sigma_points.size());
+
+        // Propagate sigma points through non-linear process model
+        for (size_t i = 0; i < sigma_points.size(); ++i) {
+            transformed_sigma_points[i] = f_model(sigma_points[i], dt);
+        }
+
+        // Calculate predicted mean
+        Eigen::VectorXd x_pred = Eigen::VectorXd::Zero(x_.size());
+        for (size_t i = 0; i < transformed_sigma_points.size(); ++i) {
+            x_pred += Wm_(i) * transformed_sigma_points[i];
+        }
+
+        // Calculate predicted covariance
+        Eigen::MatrixXd P_pred = Eigen::MatrixXd::Zero(x_.size(), x_.size());
+        for (size_t i = 0; i < transformed_sigma_points.size(); ++i) {
+            Eigen::VectorXd diff = transformed_sigma_points[i] - x_pred;
+            P_pred += Wc_(i) * diff * diff.transpose();
+        }
+        P_pred += Q; // Add process noise
+
+        x_ = x_pred;
+        P_ = P_pred;
+        apply_matrix_guardrails();
+    }
+
+    // Update step using Unscented Transform
+    void update(const Eigen::VectorXd& z, const Eigen::MatrixXd& R) {
+        std::vector<Eigen::VectorXd> sigma_points = generate_sigma_points();
+        std::vector<Eigen::VectorXd> transformed_sigma_points_meas(sigma_points.size());
+
+        // Propagate sigma points through non-linear measurement model
+        for (size_t i = 0; i < sigma_points.size(); ++i) {
+            transformed_sigma_points_meas[i] = h_model(sigma_points[i]);
+        }
+
+        // Calculate predicted measurement mean
+        Eigen::VectorXd z_pred = Eigen::VectorXd::Zero(z.size());
+        for (size_t i = 0; i < transformed_sigma_points_meas.size(); ++i) {
+            z_pred += Wm_(i) * transformed_sigma_points_meas[i];
+        }
+
+        // Calculate innovation covariance (Pzz)
+        Eigen::MatrixXd Pzz = Eigen::MatrixXd::Zero(z.size(), z.size());
+        for (size_t i = 0; i < transformed_sigma_points_meas.size(); ++i) {
+            Eigen::VectorXd diff = transformed_sigma_points_meas[i] - z_pred;
+            Pzz += Wc_(i) * diff * diff.transpose();
+        }
+        Pzz += R; // Add measurement noise
+        Pzz = (Pzz + Pzz.transpose()) * 0.5; // Ensure symmetry
+
+        // Calculate cross-covariance (Pxz)
+        Eigen::MatrixXd Pxz = Eigen::MatrixXd::Zero(x_.size(), z.size());
+        for (size_t i = 0; i < sigma_points.size(); ++i) {
+            Eigen::VectorXd x_diff = sigma_points[i] - x_;
+            Eigen::VectorXd z_diff = transformed_sigma_points_meas[i] - z_pred;
+            Pxz += Wc_(i) * x_diff * z_diff.transpose();
+        }
+
+        // Kalman Gain
+        Eigen::MatrixXd K;
+        Eigen::LLT<Eigen::MatrixXd> llt_pzz(Pzz);
+        if (llt_pzz.info() == Eigen::Success) {
+            K = Pxz * llt_pzz.solve(Eigen::MatrixXd::Identity(Pzz.rows(), Pzz.cols()));
+        } else {
+            // Fallback for non-SPD Pzz (should be rare)
+            std::cerr << "Warning: Pzz not SPD in SRUKF update. Using pseudo-inverse." << std::endl;
+            K = Pxz * Pzz.completeOrthogonalDecomposition().pseudoInverse();
+        }
+        
+        // Update state and covariance
+        innovation_ = z - z_pred; // Store innovation
+        innovationCov_ = Pzz;     // Store innovation covariance
+        x_ = x_ + K * innovation_;
+        P_ = P_ - K * Pzz * K.transpose();
+
+        apply_matrix_guardrails();
+
+        // Compute Gaussian likelihood for mode probability update
+        double detS = std::max(Pzz.determinant(), std::numeric_limits<double>::epsilon()); // Avoid issues with near-zero determinant
+        double mahal = innovation_.transpose() * Pzz.inverse() * innovation_;
+        likelihood_ = std::exp(-0.5 * mahal) / std::sqrt(std::pow(2 * M_PI, z.size()) * detS);
+    }
+
+    StateVector getState() const { return {x_, P_}; }
+    double getLikelihood() const { return likelihood_; }
+    const Eigen::VectorXd& getInnovation() const { return innovation_; }
+    Eigen::MatrixXd getInnovationCovariance() const { return innovationCov_; }
+
+    // --- Motion Models (f) and Measurement Model (h) ---
+    // These functions define the non-linear dynamics and sensor models for the SRUKF.
+    // They operate on the 16D state vector.
+
+    // Process Model: f(x, dt)
+    Eigen::VectorXd f_model(const Eigen::VectorXd& x_in, double dt) {
+        Eigen::VectorXd x_new = x_in;
+
+        // Position update based on velocity and acceleration
+        x_new.segment<3>(0) = x_in.segment<3>(0) + x_in.segment<3>(3) * dt + 0.5 * x_in.segment<3>(6) * dt * dt;
+        // Velocity update based on acceleration
+        x_new.segment<3>(3) = x_in.segment<3>(3) + x_in.segment<3>(6) * dt;
+
+        if (model_type_ == "CV") {
+            // No acceleration dynamics, ax,ay,az remain constant (or decay to 0)
+            x_new.segment<3>(6) = x_in.segment<3>(6); // Or set to zero for pure CV
+        } else if (model_type_ == "CA") {
+            // Acceleration remains constant
+            x_new.segment<3>(6) = x_in.segment<3>(6);
+        } else if (model_type_ == "CT") {
+            // Coordinated Turn Model (horizontal plane turn for simplicity)
+            // Assumes constant yaw rate, zero pitch/roll rates for simplicity.
+            double yaw = x_in(9); // Current yaw
+            double yaw_rate = x_in(12); // Current yaw rate
+            double vx = x_in(3);
+            double vy = x_in(4);
+
+            if (std::fabs(yaw_rate) > 1e-6) { // Avoid division by zero
+                double theta = yaw_rate * dt;
+                double cos_theta = std::cos(theta);
+                double sin_theta = std::sin(theta);
+
+                // Update position based on turn
+                x_new(0) = x_in(0) + (vx * sin_theta + vy * (1.0 - cos_theta)) / yaw_rate;
+                x_new(1) = x_in(1) + (vy * sin_theta - vx * (1.0 - cos_theta)) / yaw_rate;
+
+                // Update velocity
+                x_new(3) = vx * cos_theta - vy * sin_theta;
+                x_new(4) = vx * sin_theta + vy * cos_theta;
+
+                // Update yaw
+                x_new(9) = yaw + theta;
+            } else {
+                // If yaw_rate is zero, it behaves like CV in horizontal plane
+                x_new(0) = x_in(0) + vx * dt;
+                x_new(1) = x_in(1) + vy * dt;
+            }
+            // Other accelerations (ax,ay,az), pitch, roll, pitch_rate, roll_rate remain constant
+            x_new.segment<3>(6) = x_in.segment<3>(6); // Accel
+            x_new(10) = x_in(10); // Pitch
+            x_new(11) = x_in(11); // Roll
+            x_new(13) = x_in(13); // Pitch rate
+            x_new(14) = x_in(14); // Roll rate
+        } else if (model_type_ == "ST") {
+            // Stealth/Erratic model: behaves like CV but with higher process noise Q
+            // Dynamics are same as CV, but Q will be larger (handled by IMM)
+            x_new.segment<3>(6) = x_in.segment<3>(6); // Accel
+        }
+
+        // Orientation rates (pitch_rate, roll_rate) remain constant
+        x_new(13) = x_in(13);
+        x_new(14) = x_in(14);
+
+        // RCS estimate remains constant (can add a random walk for uncertainty)
+        x_new(15) = x_in(15);
+
+        // SE(3) Lie Group Orientation (Advanced Option - Placeholder)
+        // If using SE(3), x_in(9-11) would be a quaternion or rotation matrix,
+        // and the update would involve Lie group exponentials.
+        // This requires a specialized state representation and Lie group math library.
+        // For now, Euler angles are used as placeholders.
+
+        return x_new;
+    }
+
+    // Measurement Model: h(x)
+    Eigen::VectorXd h_model(const Eigen::VectorXd& x_in) {
+        // Sensor position is assumed to be at origin (0,0,0) for simplicity.
+        // For multi-static, sensor_id would be used to get sensor position.
+        Eigen::Vector3d pos = x_in.segment<3>(0);
+        Eigen::Vector3d vel = x_in.segment<3>(3);
+
+        double range = pos.norm();
+        if (range < 1e-6) range = 1e-6; // Avoid division by zero
+
+        Eigen::VectorXd z_pred(MEAS_DIM);
+        z_pred(0) = range; // Range
+
+        // Doppler: (pos.dot(vel) / range) * (2.0 / lambda)
+        // Assuming lambda is implicitly handled by the constant '2.0' for simplicity
+        z_pred(1) = (pos.dot(vel) / range) * 2.0; // Doppler velocity
+
+        z_pred(2) = std::atan2(pos(1), pos(0)); // Azimuth
+        z_pred(3) = std::atan2(pos(2), std::sqrt(pos(0) * pos(0) + pos(1) * pos(1))); // Elevation
+
+        // FSR/Passive Sensing Measurement Model (Placeholder)
+        // If a measurement is from FSR, its 'z' might be signal_power_drop or phase change.
+        // The h_model would then predict this based on target state and illuminator/receiver geometry.
+        // h_shadow(x) = alpha * signal_power_drop(x, signal_origin, receiver)
+        // This would require additional inputs to h_model (e.g., signal_origin, receiver_pos).
+        // For now, it assumes active radar measurements.
+
+        return z_pred;
+    }
+
+    // Matrix Guardrails: Ensures P remains Positive Semi-Definite (SPD)
+    void apply_matrix_guardrails() {
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(P_);
+        Eigen::VectorXd evals = es.eigenvalues();
+        Eigen::MatrixXd evecs = es.eigenvectors();
+        bool adjusted = false;
+        for (int i = 0; i < evals.size(); ++i) {
+            if (evals(i) < 1e-9) { // Small positive value to ensure SPD
+                evals(i) = 1e-9;
+                adjusted = true;
+            }
+        }
+        if (adjusted) {
+            P_ = evecs * evals.asDiagonal() * evecs.transpose();
+            // Ensure symmetry after adjustment
+            P_ = (P_ + P_.transpose()) * 0.5;
+        }
+    }
+
+private:
+    Eigen::VectorXd x_;
+    Eigen::MatrixXd P_;
+    std::string model_type_;
+    double likelihood_;
+    Eigen::VectorXd innovation_;
+    Eigen::MatrixXd innovationCov_;
+
+    // UKF parameters
+    double lambda_;
+    Eigen::VectorXd Wm_, Wc_; // Weights for mean and covariance
+};
+
+// IMM Filter Core
+class IMMFilter {
+public:
+    IMMFilter(int state_dim, int meas_dim, const std::vector<std::string>& model_types)
+        : pi_(Eigen::MatrixXd::Constant(model_types.size(), model_types.size(), 1.0 / model_types.size())), // Uniform transition
+          mu_(Eigen::VectorXd::Constant(model_types.size(), 1.0 / model_types.size())), // Uniform initial mode probs
+          combined_state_({Eigen::VectorXd::Zero(state_dim), Eigen::MatrixXd::Identity(state_dim, state_dim)}) {
+        for (auto& m : model_types) {
+            models_.emplace_back(state_dim, meas_dim, m);
+            disabled_model_frames_.push_back(0); // Initialize lazy mode counter
+        }
+    }
+
+    void setTransitionMatrix(const Eigen::MatrixXd& T) { pi_ = T; }
+
+    // Initializes all SRUKF models within the IMM
+    void initialize(const Eigen::VectorXd& x0, const Eigen::MatrixXd& P0) {
+        for (auto& mdl : models_) {
+            mdl.initialize(x0, P0);
+        }
+        mu_.setConstant(1.0 / models_.size()); // Reset mode probabilities
+        combined_state_ = {x0, P0};
+    }
+
+    // Predict step: Performs mixing and individual model predictions
+    void predict(double dt) {
+        int M = models_.size();
+        Eigen::MatrixXd mu_j_given_i(M, M); // Mixing probabilities: P(mode_i | mode_j at k-1)
+        Eigen::VectorXd c_j(M); // Normalization constants
+
+        // Calculate mixing probabilities and normalization constants
+        for (int j = 0; j < M; ++j) {
+            c_j(j) = 0;
+            for (int i = 0; i < M; ++i) {
+                mu_j_given_i(i, j) = pi_(i, j) * mu_(i);
+                c_j(j) += mu_j_given_i(i, j);
+            }
+            // Normalize mixing probabilities
+            for (int i = 0; i < M; ++i) {
+                mu_j_given_i(i, j) /= (c_j(j) > std::numeric_limits<double>::epsilon() ? c_j(j) : 1.0);
+            }
+        }
+
+        // Mix states & covariances for each model
+        std::vector<StateVector> mixed_states(M);
+        for (int j = 0; j < M; ++j) {
+            Eigen::VectorXd x0_j = Eigen::VectorXd::Zero(models_[j].getState().x.size());
+            Eigen::MatrixXd P0_j = Eigen::MatrixXd::Zero(models_[j].getState().P.rows(), models_[j].getState().P.cols());
+
+            for (int i = 0; i < M; ++i) {
+                StateVector s_i = models_[i].getState();
+                x0_j += s_i.x * mu_j_given_i(i, j);
+            }
+
+            for (int i = 0; i < M; ++i) {
+                StateVector s_i = models_[i].getState();
+                Eigen::VectorXd dx = s_i.x - x0_j;
+                P0_j += mu_j_given_i(i, j) * (s_i.P + dx * dx.transpose());
+            }
+            mixed_states[j].x = x0_j;
+            mixed_states[j].P = P0_j;
+        }
+
+        // Initialize filters with mixed states and perform individual predictions
+        for (int j = 0; j < M; ++j) {
+            models_[j].initialize(mixed_states[j].x, mixed_states[j].P);
+            // Qmodel calculates adaptive Q based on model type and history (conceptual)
+            models_[j].predict(dt, Qmodel(models_[j].model_type_, dt, {})); // Empty history for simplicity
+        }
+    }
+
+    // Update step: Individual model updates, mode probability update (via ABP), and state combination (via GCI)
+    void update(const Measurement& meas, const Eigen::MatrixXd& R, BeliefUpdater& updater) {
+        int M = models_.size();
+        Eigen::VectorXd likelihoods(M);
+
+        // Individual mode updates and likelihood calculation
+        for (int j = 0; j < M; ++j) {
+            // If lazy mode switching is active and model is disabled, skip update
+            if (disabled_model_frames_[j] > 0) {
+                likelihoods(j) = 1e-12; // Very small likelihood for disabled models
+                continue;
+            }
+            models_[j].update(meas.z, R);
+            likelihoods(j) = models_[j].getLikelihood();
+        }
+
+        // Update mode probabilities via Adaptive Belief Propagation
+        mu_ = updater.update_probabilities(likelihoods, mu_, pi_);
+
+        // Combine state estimates via GCICombiner
+        std::vector<StateVector> current_states(M);
+        for (int j = 0; j < M; ++j) {
+            current_states[j] = models_[j].getState();
+        }
+        combined_state_ = GCICombiner::combine(current_states, mu_);
+
+        // Apply matrix guardrails to the combined covariance
+        combined_state_.P = (combined_state_.P + combined_state_.P.transpose()) * 0.5; // Ensure symmetry
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(combined_state_.P);
+        Eigen::VectorXd evals = es.eigenvalues();
+        Eigen::MatrixXd evecs = es.eigenvectors();
+        bool adjusted = false;
+        for (int i = 0; i < evals.size(); ++i) {
+            if (evals(i) < 1e-9) { evals(i) = 1e-9; adjusted = true; }
+        }
+        if(adjusted) combined_state_.P = evecs * evals.asDiagonal() * evecs.transpose();
+    }
+
+    // Handles missed detections (no measurement associated)
+    void handle_missed_detection() {
+        // If no measurement, mode probabilities decay based on transition matrix
+        // and uncertainty increases.
+        mu_ = pi_.transpose() * mu_;
+        double sum_mu = mu_.sum();
+        if (sum_mu > std::numeric_limits<double>::epsilon()) {
+            mu_ /= sum_mu;
+        } else {
+            mu_.setConstant(1.0 / models_.size()); // Reset to uniform if all modes die
+        }
+
+        // Increase uncertainty of combined state (e.g., by adding a small Q)
+        combined_state_.P += Eigen::MatrixXd::Identity(STATE_DIM, STATE_DIM) * 0.1;
+        // Also manage lazy modes
+        manage_lazy_modes();
+    }
+
+    const Eigen::VectorXd& getModeProbabilities() const { return mu_; }
+    StateVector getCombinedState() const { return combined_state_; }
+    double get_max_mode_probability() const { return mu_.maxCoeff(); }
+    double get_mode_entropy() const {
+        double entropy = 0.0;
+        for (int i = 0; i < mu_.size(); ++i) {
+            if (mu_(i) > std::numeric_limits<double>::epsilon()) {
+                entropy -= mu_(i) * std::log(mu_(i));
+            }
+        }
+        return entropy;
+    }
+    bool confidence_is_low() const {
+        // Example heuristic: if max mode probability is low, or entropy is high
+        return get_max_mode_probability() < PF_IMM_MAX_MODE_PROB_THRESHOLD || get_mode_entropy() > 0.8; // Tune this
+    }
+
+    // Lazy Mode Switching
+    void manage_lazy_modes() {
+        const double MIN_MODE_PROB_FOR_ACTIVE = 0.01;
+        const int DISABLE_THRESHOLD_FRAMES = 10;
+
+        for (size_t i = 0; i < models_.size(); ++i) {
+            if (mu_(i) < MIN_MODE_PROB_FOR_ACTIVE) {
+                disabled_model_frames_[i]++;
+                if (disabled_model_frames_[i] > DISABLE_THRESHOLD_FRAMES) {
+                    // Model is effectively disabled, its likelihood will be set very low in update()
+                    // No further action needed here, just tracking disable state.
+                }
+            } else {
+                disabled_model_frames_[i] = 0; // Reset counter if mode becomes active again
+            }
+        }
+    }
+
+    // Calculates adaptive Q for a specific model type (conceptual integration of EntropyRegulator)
+    Eigen::MatrixXd Qmodel(const std::string& model_type, double dt, const std::vector<double>& historical_innovation_magnitude) {
+        Eigen::MatrixXd Q_base = Eigen::MatrixXd::Identity(STATE_DIM, STATE_DIM) * Q_BASE_FACTOR;
+
+        // Inflate Q for Stealth model
+        if (model_type == "ST") {
+            Q_base *= Q_STEALTH_FACTOR;
+        }
+
+        // Apply entropy-based Q adjustment (conceptual)
+        // This would ideally use the overall system entropy or track-specific entropy
+        // For simplicity, we'll use a dummy entropy score here
+        double current_entropy_score = get_mode_entropy(); // Example: use IMM mode entropy
+        EntropyRegulator reg(K_Q_ENTROPY, K_R_ENTROPY); // Create a regulator instance
+        Eigen::MatrixXd Q_adjusted = reg.adjust_Q(Q_base, current_entropy_score);
+
+        // Feedback Control from Innovation History (conceptual)
+        if (!historical_innovation_magnitude.empty()) {
+            double avg_innov_norm = std::accumulate(historical_innovation_magnitude.begin(), historical_innovation_magnitude.end(), 0.0) / historical_innovation_magnitude.size();
+            // If average innovation is high, increase Q to allow more flexibility
+            Q_adjusted *= (1.0 + avg_innov_norm * 0.1); // Tune factor
+        }
+
+        return Q_adjusted;
+    }
+
+    // Get the last innovation from the combined state (useful for TrustScoreCalculator)
+    Eigen::VectorXd getInnovation() const {
+        // This is a simplified approach. In a full IMM, the innovation would be
+        // a weighted average of individual filter innovations.
+        // For now, we'll return the innovation from the most probable model, or a dummy.
+        if (models_.empty()) return Eigen::VectorXd::Zero(MEAS_DIM);
+        int most_probable_idx = 0;
+        mu_.maxCoeff(&most_probable_idx);
+        return models_[most_probable_idx].getInnovation();
+    }
+
+
+public: // Public for easier access in main loop (for testing/debugging)
+    std::vector<SRUKF> models_;
+private:
+    Eigen::MatrixXd pi_;          // mode transition probabilities
+    Eigen::VectorXd mu_;          // mode probabilities
+    StateVector combined_state_;  // Fused state and covariance
+    std::vector<int> disabled_model_frames_; // Counter for lazy mode switching
+};
+
+// Particle Filter Fallback
+class ParticleFilter {
+public:
+    struct Particle { Eigen::VectorXd x; double weight; };
+    std::vector<Particle> particles_;
+    int num_particles_;
+    bool is_active_;
+    double dt_ = DT; // Use global DT
+
+    std::mt19937 rng_; // Random number generator
+    std::normal_distribution<double> normal_dist_; // For adding noise
+
+    ParticleFilter(int N, int state_dim) : num_particles_(N), is_active_(false),
+                                            rng_(std::random_device{}()), normal_dist_(0.0, 1.0) {
+        particles_.resize(N);
+        for (auto& p : particles_) p.x = Eigen::VectorXd::Zero(state_dim);
+    }
+
+    void activate() { is_active_ = true; }
+    void deactivate() { is_active_ = false; }
+    bool active() const { return is_active_; }
+
+    // Calculates effective number of particles
+    double getEffectiveN() const {
+        double sumw = 0, sumw2 = 0;
+        for (const auto& p : particles_) { sumw += p.weight; sumw2 += p.weight * p.weight; }
+        if (sumw2 < std::numeric_limits<double>::epsilon()) return 0;
+        return (sumw*sumw)/sumw2;
+    }
+
+    // Reinitializes particles around a given mean and covariance (from IMM)
+    void reinit_from_IMM(const Eigen::VectorXd& mean, const Eigen::MatrixXd& cov) {
+        Eigen::MatrixXd L;
+        Eigen::LLT<Eigen::MatrixXd> llt(cov);
+        if (llt.info() == Eigen::Success) {
+            L = llt.matrixL();
+        } else {
+            // Fallback for non-positive definite covariance
+            std::cerr << "Warning: PF reinit_from_IMM received non-SPD covariance. Perturbing." << std::endl;
+            Eigen::MatrixXd perturbed_cov = cov + Eigen::MatrixXd::Identity(cov.rows(), cov.cols()) * 1e-9;
+            llt.compute(perturbed_cov);
+            if (llt.info() == Eigen::Success) {
+                L = llt.matrixL();
+            } else {
+                std::cerr << "Error: PF reinit_from_IMM failed Cholesky even after perturbation. Using identity L." << std::endl;
+                L = Eigen::MatrixXd::Identity(cov.rows(), cov.cols()) * std::sqrt(cov.trace() / cov.rows());
+            }
+        }
+
+        for (auto& p : particles_) {
+            // Sample from a Gaussian distribution using Cholesky factor
+            p.x = mean + L * Eigen::VectorXd::NullaryExpr(mean.size(), [&](int){return normal_dist_(rng_);});
+            p.weight = 1.0 / num_particles_;
+        }
+    }
+
+    // Update step: Propagate particles, update weights based on measurement likelihood, then resample
+    void update(const Measurement& meas, const Eigen::MatrixXd& R) {
+        if (!is_active_) return;
+
+        double total_weight = 0;
+        for (auto& p : particles_) {
+            // 1. Propagate particle through process model (simplified CV with noise)
+            // This should be a more robust process model, potentially matching IMM modes
+            p.x(0) += p.x(3) * dt_;
+            p.x(1) += p.x(4) * dt_;
+            p.x(2) += p.x(5) * dt_;
+            // Add process noise to particle state (random walk)
+            for (int i = 0; i < STATE_DIM; ++i) {
+                p.x(i) += normal_dist_(rng_) * 0.05; // Small process noise
+            }
+
+            // 2. Compute weight based on likelihood of measurement given particle's state
+            SRUKF temp_srukf(p.x.size(), meas.z.size(), "CV"); // Use a temp SRUKF for h_model
+            Eigen::VectorXd pred_z = temp_srukf.h_model(p.x); // Particle's predicted measurement
+            Eigen::VectorXd innov = meas.z - pred_z;
+
+            // Compute Gaussian likelihood for weight update
+            // R should be the adaptive R passed from the main loop
+            double detR = std::max(R.determinant(), std::numeric_limits<double>::epsilon());
+            double mahal = innov.transpose() * R.inverse() * innov;
+            double likelihood = std::exp(-0.5 * mahal) / std::sqrt(std::pow(2 * M_PI, meas.z.size()) * detR);
+
+            p.weight *= likelihood;
+            total_weight += p.weight;
+        }
+
+        // Normalize weights
+        if (total_weight > std::numeric_limits<double>::epsilon()) {
+            for (auto& p : particles_) p.weight /= total_weight;
+        } else {
+            // All weights are zero, re-initialize uniformly (filter divergence)
+            std::cerr << "Warning: PF weights collapsed. Re-initializing particles uniformly." << std::endl;
+            for (auto& p : particles_) p.weight = 1.0 / num_particles_;
+        }
+
+        // Resample if effective number of particles is too low (e.g., < N/2)
+        if (getEffectiveN() < num_particles_ / 2.0) {
+            resample();
+        }
+    }
+
+    // Systematic Resampling (efficient and common)
+    void resample() {
+        std::vector<Particle> new_particles;
+        new_particles.reserve(num_particles_);
+
+        std::uniform_real_distribution<double> unif_dist(0.0, 1.0 / num_particles_);
+        double r = unif_dist(rng_); // Start point for sampling wheel
+
+        double c = particles_[0].weight; // Cumulative sum of weights
+        int i = 0; // Index for current particle
+
+        for (int m = 0; m < num_particles_; ++m) {
+            double U = r + m * (1.0 / num_particles_); // Position on sampling wheel
+            while (U > c && i < num_particles_ - 1) {
+                i++;
+                c += particles_[i].weight;
+            }
+            new_particles.push_back(particles_[i]);
+            new_particles.back().weight = 1.0 / num_particles_; // Reset weights to uniform
+        }
+        particles_ = new_particles;
+    }
+
+    // Get combined state estimate from particles (weighted mean and covariance)
+    StateVector getCombinedState() const {
+        StateVector res;
+        int dim = particles_[0].x.size();
+        res.x = Eigen::VectorXd::Zero(dim);
+        for (const auto& p : particles_) res.x += p.weight * p.x;
+
+        res.P = Eigen::MatrixXd::Zero(dim, dim);
+        for (const auto& p : particles_) {
+            Eigen::VectorXd d = p.x - res.x;
+            res.P += p.weight * (d * d.transpose());
+        }
+        return res;
+    }
+
+private:
+    // Measurement function for PF (same as SRUKF h_model) - used for weight update
+    Eigen::VectorXd h_model(const Eigen::VectorXd& x_in) {
+        Eigen::Vector3d pos = x_in.segment<3>(0);
+        Eigen::Vector3d vel = x_in.segment<3>(3);
+        double range = pos.norm();
+        if (range < 1e-6) range = 1e-6;
+
+        Eigen::VectorXd z_pred(MEAS_DIM);
+        z_pred(0) = range;
+        z_pred(1) = (pos.dot(vel) / range) * 2.0;
+        z_pred(2) = std::atan2(pos(1), pos(0));
+        z_pred(3) = std::atan2(pos(2), std::sqrt(pos(0) * pos(0) + pos(1) * pos(1)));
+        return z_pred;
+    }
+};
+
+// --- Track Management and Main Loop ---
+
+struct Track {
+    std::string id;
+    IMMFilter imm;
+    ParticleFilter pf;
+    double trust_score;
+    bool use_pf_fallback; // Flag to indicate if PF should be used as fallback
+    ResidualTracker residual_tracker; // For innovation gate memory
+    EigenvalueMonitor eigenvalue_monitor; // For covariance eigenvalue analysis
+    // Store history for RTS smoother
+    std::vector<StateVector> imm_state_history;
+    std::vector<Measurement> measurement_history;
+    std::vector<double> rcs_estimate_history; // For RCS estimate trend analysis
+
+    Track(const std::string& track_id, int state_dim, int meas_dim, const std::vector<std::string>& model_types, int num_particles, int residual_window_size)
+        : id(track_id), imm(state_dim, meas_dim, model_types), pf(num_particles, state_dim),
+          use_pf_fallback(false), residual_tracker(residual_window_size) {
+        // Initialize history vectors
+    }
+};
+
+// --- Global Sensor/Data Functions (Simulated) ---
+
+RawSensorData get_raw_sensor_data() {
+    static double current_time = 0.0;
+    current_time += DT;
+    return {current_time};
+}
+
+// Function to preprocess raw sensor data (this is your ML layer's responsibility)
+ProcessedSensorInputs pre_processor_module_process(const RawSensorData& raw_data) {
+    // This function would be implemented in your separate ML/pre-processing layer.
+    // It takes raw sensor data, performs CFAR, micro-Doppler feature extraction,
+    // ML inference for P_drone, etc., and returns structured inputs for the filter.
+    // Placeholder for demonstration:
+    Measurement m;
+    m.timestamp = raw_data.timestamp;
+    // Simulate a target moving: starts at (0,0,100) moving at (5,5,0)
+    static double x = 0, y = 0, z = 100;
+    static double vx = 5, vy = 5, vz = 0;
+    x += vx * DT; y += vy * DT; z += vz * DT;
+    if (x > 100) { vx = -5; } if (x < 0) { vx = 5; } // Simple bounce
+    if (y > 100) { vy = -5; } if (y < 0) { vy = 5; }
+    if (z > 200) { vz = -2; } if (z < 50) { vz = 2; } // Vertical movement
+
+    Eigen::Vector3d pos(x, y, z);
+    Eigen::Vector3d vel(vx, vy, vz);
+    double range = pos.norm();
+    if (range < 1e-6) range = 1e-6;
+
+    m.z = Eigen::Vector4d(range, (pos.dot(vel) / range) * 2.0, std::atan2(pos(1), pos(0)), std::atan2(pos(2), std::sqrt(pos(0)*pos(0)+pos(1)*pos(1))));
+    m.snr = 20.0 + (std::sin(raw_data.timestamp) * 5.0); // Simulate varying SNR
+    m.clutter_level = 0.1 + (std::cos(raw_data.timestamp) * 0.05); // Simulate varying clutter
+    m.sensor_id = "radar_1";
+    m.is_spoofed = (raw_data.timestamp > 5.0 && raw_data.timestamp < 6.0); // Simulate spoofing
+    m.is_jammed = (raw_data.timestamp > 7.0 && raw_data.timestamp < 8.0);   // Simulate jamming
+    m.signal_power_drop = 0.0; // Placeholder for FSR
+
+    ProcessedSensorInputs inputs;
+    inputs.measurements.push_back(m);
+    inputs.classifier_confidence = 0.8 + (std::sin(raw_data.timestamp * 2.0) * 0.1); // Simulate P_drone
+    inputs.micro_doppler_strength = 0.7 + (std::cos(raw_data.timestamp * 3.0) * 0.1); // Simulate s_md
+    inputs.overall_clutter_score = m.clutter_level;
+    inputs.micro_pattern_confidences["jittery_hover"] = (raw_data.timestamp > 3.0 && raw_data.timestamp < 4.0) ? 0.9 : 0.1;
+    return inputs;
+}
+
+// Helper function for adaptive R calculation
+Eigen::MatrixXd calculate_adaptive_R(const ProcessedSensorInputs& inputs, int meas_dim,
+                                     EntropyRegulator& entropy_regulator, double entropy_score,
+                                     double visibility_coefficient, bool is_spoofed, bool is_jammed) {
+    double P_drone = inputs.classifier_confidence;
+    double s_md = inputs.micro_doppler_strength;
+    double snr = inputs.measurements.empty() ? 0.0 : inputs.measurements[0].snr;
+    double clutter_level = inputs.overall_clutter_score;
+
+    Eigen::MatrixXd R_base = Eigen::MatrixXd::Identity(meas_dim, meas_dim);
+    R_base(0,0) = 1.0; R_base(1,1)=0.5; R_base(2,2)=0.001; R_base(3,3)=0.001; // Base R values for range, doppler, az, el
+
+    Eigen::MatrixXd R_min_matrix = Eigen::MatrixXd::Identity(meas_dim, meas_dim) * R_MIN_BASE;
+    Eigen::MatrixXd R_max_matrix = Eigen::MatrixXd::Identity(meas_dim, meas_dim) * R_MAX_BASE;
+
+    double normalized_snr = std::min(1.0, snr / MAX_EXPECTED_SNR);
+    double normalized_clutter = std::min(1.0, clutter_level / MAX_EXPECTED_CLUTTER);
+
+    double confidence_factor = P_drone * s_md * normalized_snr * (1.0 - normalized_clutter);
+    confidence_factor = std::max(0.0, std::min(1.0, confidence_factor));
+
+    Eigen::MatrixXd R_adaptive_base = R_min_matrix + (R_max_matrix - R_min_matrix) * std::exp(-K_CONFIDENCE_R * confidence_factor);
+
+    // Apply Directional Expectation Filtering: increase R in blind spots
+    R_adaptive_base *= (1.0 / std::max(VISIBILITY_MIN_COEFF, visibility_coefficient));
+
+    // Apply Adversarial Robustness: Drastically increase R if spoofing/jamming detected
+    if (is_spoofed || is_jammed) {
+        R_adaptive_base *= 1000.0; // Very high uncertainty if adversarial attack is present
+    }
+
+    // Apply Entropy-based R adjustment
+    return entropy_regulator.adjust_R(R_adaptive_base, entropy_score);
+}
+
+// Helper function for robust data association (JPDAF/MHT - simplified conceptual)
+std::vector<Association> data_associate(const std::vector<Measurement>& current_measurements,
+                                        double P_drone_overall, std::vector<Track>& active_tracks, double dt) {
+    std::vector<Association> associations;
+    // This is a highly complex module (JPDAF/MHT). Simplified conceptual pseudocode:
+
+    // For each measurement
+    for (int meas_idx = 0; meas_idx < current_measurements.size(); ++meas_idx) {
+        const Measurement& current_measurement = current_measurements[meas_idx];
+        double best_likelihood = 0.0;
+        std::string best_track_id = "";
+
+        // If measurement is flagged as spoofed/jammed, consider alternative association logic or discard
+        if (current_measurement.is_spoofed || current_measurement.is_jammed) {
+            // In a full MHT, this might involve creating a "spoofing hypothesis" for this measurement.
+            // For this simplified pseudocode, we'll allow it to pass but with reduced likelihood.
+        }
+
+        // For each active track
+        for (Track& track : active_tracks) {
+            // Use SensorCorrectionModel if multi-static
+            // Measurement corrected_z = SensorCorrectionModel::apply_offset(current_measurement.z, current_measurement.sensor_id);
+
+            Eigen::VectorXd predicted_z = track.imm.models_[0].h_model(track.imm.getCombinedState().x);
+            Eigen::MatrixXd S_gate = track.imm.models_[0].getInnovationCovariance(); // From last update or approximated
+
+            Eigen::VectorXd innovation = current_measurement.z - predicted_z;
+            double mahalanobis_dist_sq = innovation.transpose() * S_gate.inverse() * innovation;
+
+            if (mahalanobis_dist_sq < GATE_THRESHOLD_SQ) {
+                double likelihood = std::exp(-0.5 * mahalanobis_dist_sq) / std::sqrt(std::max(1e-12, S_gate.determinant()));
+                likelihood *= P_drone_overall; // Weight by overall drone probability
+
+                // Motion Complexity Penalty
+                Eigen::Vector3d implied_accel = innovation.head<3>() / (dt * dt); // Simplified
+                if (implied_accel.norm() > MAX_PLAUSIBLE_ACCEL_NORM) {
+                    likelihood *= 0.01; // Heavily penalize
+                }
+
+                if (current_measurement.is_spoofed || current_measurement.is_jammed) {
+                    likelihood *= 0.1; // Further reduce likelihood for adversarial measurements
+                }
+
+                // Innovation Gate Memory check (simplified)
+                if (track.residual_tracker.is_anomalous()) {
+                    likelihood *= 0.5; // Reduce likelihood if track's residual history is anomalous
+                }
+
+                if (likelihood > best_likelihood) {
+                    best_likelihood = likelihood;
+                    best_track_id = track.id;
+                }
+            }
+        }
+        if (!best_track_id.empty()) {
+            associations.push_back({best_track_id, meas_idx, best_likelihood});
+        }
+    }
+    return associations;
+}
+
+
+// --- Main Filter Loop ---
+int main() {
+    std::cout << std::fixed << std::setprecision(3); // For cleaner output
+
+    // Initialize core helper classes
+    TrackEntropyMonitor entropy_monitor;
+    BeliefUpdater abp_updater(MODEL_TYPES.size());
+    EntropyRegulator entropy_regulator(K_Q_ENTROPY, K_R_ENTROPY);
+    EigenvalueMonitor eigenvalue_monitor;
+    MicroPatternManager micro_pattern_manager;
+    SensorController sensor_controller; // For cognitive feedback
+    // SparseOutlierModule sparse_outlier_module; // If using sparse recovery
+    // MultiBankManager multi_bank_manager; // If using multiple filter banks
+    // RFSPHDModel phd_filter(STATE_DIM, MEAS_DIM); // If using RFS
+
+    std::vector<Track> active_tracks;
+    
+    // Example initial track setup
+    Track initial_track("drone_001", STATE_DIM, MEAS_DIM, MODEL_TYPES, NUM_PARTICLES, RESIDUAL_WINDOW_SIZE);
+    
+    // Set initial state for the IMM models in the first track
+    Eigen::VectorXd x0 = Eigen::VectorXd::Zero(STATE_DIM);
+    x0(0)=0; x0(1)=0; x0(2)=100; // Initial position
+    x0(3)=5; x0(4)=5; x0(5)=0;   // Initial velocity
+    x0(15)=0.1; // Initial RCS estimate (e.g., for a small drone)
+    Eigen::MatrixXd P0 = Eigen::MatrixXd::Identity(STATE_DIM,STATE_DIM)*10.0; // Initial covariance
+    for(auto& mdl : initial_track.imm.models_) mdl.initialize(x0, P0);
+    initial_track.imm.initialize(x0, P0); // Also initialize IMM's combined state
+
+    // Set a more realistic transition matrix for IMM (tune this based on expected drone behavior)
+    // Rows: current mode, Columns: next mode
+    // CV   CA   CT   ST
+    // CV: [0.9, 0.05, 0.02, 0.03]
+    // CA: [0.1, 0.8,  0.05, 0.05]
+    // CT: [0.05, 0.05, 0.85, 0.05]
+    // ST: [0.1, 0.1, 0.1, 0.7] (High persistence in stealth/erratic)
+    Eigen::MatrixXd pi_matrix(4,4);
+    pi_matrix << 0.9, 0.05, 0.02, 0.03,
+                 0.1, 0.8,  0.05, 0.05,
+                 0.05, 0.05, 0.85, 0.05,
+                 0.1, 0.1, 0.1, 0.7;
+    initial_track.imm.setTransitionMatrix(pi_matrix);
+
+    active_tracks.push_back(initial_track); // Add the first track
+
+    // Track history for RTS smoother (storage for all tracks)
+    std::map<std::string, std::vector<StateVector>> all_track_states_history;
+    std::map<std::string, std::vector<Measurement>> all_measurements_history;
+    BackwardSmoother backward_smoother;
+
+    // Event-Triggered Filtering variables (conceptual)
+    bool new_measurement_event = false;
+
+    for (int step = 0; step < 100; ++step) { // Simulate 100 time steps
+        std::cout << "\n--- Time Step: " << step * DT << "s ---" << std::endl;
+        RawSensorData raw_data = get_raw_sensor_data();
+        ProcessedSensorInputs processed_inputs = pre_processor_module_process(raw_data);
+
+        new_measurement_event = !processed_inputs.measurements.empty();
+
+        // Feed raw data to MicroPatternManager
+        micro_pattern_manager.process_raw_data(raw_data);
+
+        // Optional: Update PHD filter with all measurements
+        // phd_filter.update(processed_inputs.measurements);
+        // std::vector<StateVector> phd_targets = phd_filter.extract_targets(0.5);
+
+        // Data association (JPDAF/MHT logic)
+        // R_adaptive is calculated per track below, so pass a dummy or base R here if needed by data_associate
+        std::vector<Association> associations = data_associate(processed_inputs.measurements, processed_inputs.classifier_confidence, active_tracks, DT);
+
+        // Update existing tracks
+        for (Track& track : active_tracks) {
+            // Calculate track-specific entropy score for Q/R adaptation
+            double track_entropy_score = entropy_monitor.calculate_imm_entropy(track.imm.getModeProbabilities());
+
+            // Placeholder for visibility_coefficient (needs to be calculated based on track position and sensor FOV)
+            // For simplicity, assume full visibility unless spoofed/jammed
+            double visibility_coefficient = 1.0;
+
+            // Calculate adaptive R for this track
+            Eigen::MatrixXd R_adaptive = calculate_adaptive_R(
+                processed_inputs, MEAS_DIM, entropy_regulator, track_entropy_score, visibility_coefficient,
+                processed_inputs.measurements.empty() ? false : processed_inputs.measurements[0].is_spoofed,
+                processed_inputs.measurements.empty() ? false : processed_inputs.measurements[0].is_jammed
+            );
+
+            track.imm.predict(DT); // Always predict to maintain state
+
+            // Find associated measurement for this track (simplified for single association)
+            const Measurement* associated_meas = nullptr;
+            for (const auto& assoc : associations) {
+                if (assoc.track_id == track.id) {
+                    associated_meas = &processed_inputs.measurements[assoc.measurement_idx];
+                    break;
+                }
+            }
+
+            if (associated_meas) {
+                // Apply Sparse Recovery Filtering (experimental) if needed for outlier detection/removal
+                // This would involve passing the measurement and the predicted state/covariance
+                // Eigen::VectorXd raw_innovation = associated_meas->z - track.imm.models_[0].h_model(track.imm.getCombinedState().x);
+                // Eigen::MatrixXd H_matrix_for_sparse = track.imm.models_[0].get_measurement_jacobian(); // Needs to be implemented
+                // Eigen::VectorXd sparse_component = sparse_outlier_module.extract_sparse_component(raw_innovation, H_matrix_for_sparse, lambda_param);
+                // if (sparse_component.norm() > THRESHOLD) associated_meas->z -= sparse_component; // Adjust measurement
+
+                track.imm.update(*associated_meas, R_adaptive, abp_updater); // Pass ABP updater
+                track.imm.manage_lazy_modes(); // Apply lazy mode switching
+                
+                // Apply matrix guardrails to individual SRUKF models after their updates
+                for(auto& mdl : track.imm.models_) mdl.apply_matrix_guardrails();
+
+                // Update innovation history for adaptive Q and confidence
+                track.residual_tracker.update(track.imm.getInnovation());
+                // Update RCS estimate history
+                track.rcs_estimate_history.push_back(track.imm.getCombinedState().x(15));
+                if (track.rcs_estimate_history.size() > 100) track.rcs_estimate_history.erase(track.rcs_estimate_history.begin());
+
+                // Store for RTS smoother
+                track.imm_state_history.push_back(track.imm.getCombinedState());
+                track.measurement_history.push_back(*associated_meas);
+
+            } else {
+                track.imm.handle_missed_detection();
+            }
+
+            // PF fallback logic
+            double eigenvalue_anomaly_score = track.eigenvalue_monitor.analyze_covariance(track.imm.getCombinedState().P);
+            if (track.imm.confidence_is_low() || track.imm.get_max_mode_probability() < PF_IMM_MAX_MODE_PROB_THRESHOLD ||
+                track.residual_tracker.is_anomalous() || eigenvalue_anomaly_score > EIGENVALUE_ANOMALY_THRESHOLD) {
+                if (!track.pf.active()) {
+                    track.pf.activate();
+                    track.pf.reinit_from_IMM(track.imm.getCombinedState().x, track.imm.getCombinedState().P);
+                }
+                if (associated_meas) { // PF also needs a measurement if available
+                    track.pf.update(*associated_meas, R_adaptive);
+                }
+                track.pf.resample();
+            } else if (track.pf.active() && track.imm.get_max_mode_probability() > PF_IMM_MAX_MODE_PROB_REACTIVATE_THRESHOLD &&
+                       !track.residual_tracker.is_anomalous() && eigenvalue_anomaly_score < EIGENVALUE_ANOMALY_THRESHOLD / 2.0) {
+                track.pf.deactivate();
+            }
+
+            // Get micro-pattern confidence for this track
+            double micro_pattern_confidence = processed_inputs.micro_pattern_confidences.count("jittery_hover") ? processed_inputs.micro_pattern_confidences.at("jittery_hover") : 0.0;
+
+            track.trust_score = TrustScoreCalculator::compute_confidence(
+                track.imm.getCombinedState(),
+                track.imm.getInnovation(), // Use the last innovation from IMM
+                processed_inputs.classifier_confidence,
+                processed_inputs.micro_doppler_strength,
+                eigenvalue_anomaly_score,
+                micro_pattern_confidence,
+                track.imm.getModeProbabilities(),
+                track.pf.getEffectiveN(), NUM_PARTICLES,
+                track.rcs_estimate_history,
+                track.residual_tracker.get_history()
+            );
+
+            // Output current state and trust score
+            std::cout << "Track ID: " << track.id << std::endl;
+            std::cout << "  State (x,y,z): (" << track.imm.getCombinedState().x(0) << ", " << track.imm.getCombinedState().x(1) << ", " << track.imm.getCombinedState().x(2) << ")" << std::endl;
+            std::cout << "  Velocity (vx,vy,vz): (" << track.imm.getCombinedState().x(3) << ", " << track.imm.getCombinedState().x(4) << ", " << track.imm.getCombinedState().x(5) << ")" << std::endl;
+            std::cout << "  RCS Estimate: " << track.imm.getCombinedState().x(15) << std::endl;
+            std::cout << "  Trust Score: " << track.trust_score << std::endl;
+            std::cout << "  PF Active: " << (track.pf.active() ? "YES" : "NO") << std::endl;
+            std::cout << "  Max Mode Prob: " << track.imm.getModeProbabilities().maxCoeff() << std::endl;
+            std::cout << "  Eigenvalue Anomaly: " << eigenvalue_anomaly_score << std::endl;
+            std::cout << "  Residual Anomalous: " << (track.residual_tracker.is_anomalous() ? "YES" : "NO") << std::endl;
+
+
+            // Cognitive Feedback Loop: Request sensor to focus if trust is high or uncertainty is high
+            if (track.trust_score > 0.95) { // High confidence detection
+                sensor_controller.request_scanning_pattern(associated_meas ? associated_meas->sensor_id : "all_sensors", track.imm.getCombinedState().x.head<3>());
+            } else if (track_entropy_score > 0.8 && track.trust_score < 0.5) { // High uncertainty, low trust
+                 sensor_controller.request_waveform_change(associated_meas ? associated_meas->sensor_id : "all_sensors", "high_resolution_doppler");
+                 sensor_controller.request_power_increase(associated_meas ? associated_meas->sensor_id : "all_sensors", 1.5);
+            }
+            if (track.imm.getCombinedState().x(15) < 0.01 && track.trust_score > 0.7) { // Very low RCS detected with decent trust
+                sensor_controller.request_passive_mode(associated_meas ? associated_meas->sensor_id : "all_sensors", "ambient_RF");
+            }
+        }
+
+        // Manage tracks (initiate new tracks from unassociated measurements, delete old tracks)
+        // This would involve a separate track management module that uses the data_associate output.
+        // Also, consider using PHD filter outputs for new track initiation.
+
+        // Optional: Run Backward Smoother in background for historical refinement
+        // This would typically run on a separate thread or less frequently
+        // backward_smoother.smooth(all_track_states_history["track_id"], all_measurements_history["track_id"]);
+
+        // Optional: Multi-Filter Bank Voting
+        // if (multi_bank_manager.is_enabled()) {
+        //     std::vector<StateVector> voted_estimates = multi_bank_manager.vote_estimates();
+        //     // Use voted_estimates for final output or to refine active_tracks
+        // }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(DT * 1000)));
+    }
+    return 0;
+}
