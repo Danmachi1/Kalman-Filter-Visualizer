@@ -1,0 +1,4 @@
+git+https://contagon@bitbucket.org/frostlab/holodeck-ocean.git@develop
+numpy
+pynput
+pytransform3d
