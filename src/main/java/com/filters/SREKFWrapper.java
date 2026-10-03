@@ -16,7 +16,7 @@ public final class SREKFWrapper implements AutoCloseable, com.example.filtertest
     private static final Linker LINKER = Linker.nativeLinker();
     private static final Arena  ARENA  = Arena.ofShared();
     static {
-        System.loadLibrary("kalman_ekf"); // Looks for kalman_ekf.dll in java.library.path
+        System.loadLibrary(LIB_NAME); // Keep the loader and symbol lookup aligned.
     }
 
     private static final SymbolLookup LIB =
